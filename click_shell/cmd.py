@@ -12,10 +12,8 @@ from typing import Any, Callable, List, Optional, Union
 import click
 
 from ._compat import readline
-
-
-class CommandChainException(Exception):
-    pass
+import bashlex as bash
+from .exceptions import BashFeatureNotSupported, CommandChainException, ClickShellException
 
 
 class Command:
@@ -27,7 +25,6 @@ class Command:
         self.text = command
         self.cmd_type = cmd_type
 
-
 class CommandQueue(List):
     """
     ClickCmd expects a List, so we implement our own with parsing
@@ -38,24 +35,28 @@ class CommandQueue(List):
         self.queue = list()
 
     def parse_line(self, *, line: str):
-        initial_command = True
-        for command in line.split("&&"):
-            command = command.strip()
-            if initial_command:
-                self.queue.append(Command(command=command, cmd_type=Command.INITIAL))
-                initial_command = False
-                continue
-            if '||' not in command:
-                self.queue.append(Command(command=command, cmd_type=Command.AND))
-            else:
-                first = True
-                for _command in command.split("||"):
-                    _command = _command.strip()
-                    if first:
-                        self.queue.append(Command(command=_command, cmd_type=Command.AND))
-                        first = False
-                        continue
-                    self.queue.append(Command(command=_command, cmd_type=Command.OR))
+        commands = bash.parse(line)
+        commands.dump()
+
+        # initial_command = True
+        # for command in line.split("&&"):
+        #     command = command.strip()
+
+        #     if initial_command:
+        #         self.queue.append(Command(command=command, cmd_type=Command.INITIAL))
+        #         initial_command = False
+        #         continue
+        #     if '||' not in command:
+        #         self.queue.append(Command(command=command, cmd_type=Command.AND))
+        #     else:
+        #         first = True
+        #         for _command in command.split("||"):
+        #             _command = _command.strip()
+        #             if first:
+        #                 self.queue.append(Command(command=_command, cmd_type=Command.AND))
+        #                 first = False
+        #                 continue
+        #             self.queue.append(Command(command=_command, cmd_type=Command.OR))
 
     def pop(self, __index: int = ...):
         return self.queue.pop(__index)
@@ -73,8 +74,7 @@ class CommandQueue(List):
         """
         return len(self.queue)
 
-
-class ClickCmd(Cmd):
+class ClickCmd(Cmd, bash.ast.nodevisitor):
     """
     A simple wrapper around the builtin python cmd module that:
     1) makes completion work on OSX
@@ -118,6 +118,7 @@ class ClickCmd(Cmd):
             os.makedirs(os.path.dirname(self.hist_file))
 
         self.cmdqueue = CommandQueue()
+        self.last_cmd_return = None
 
     def preloop(self):
         # read our history
@@ -135,6 +136,85 @@ class ClickCmd(Cmd):
                 readline.write_history_file(self.hist_file)
             except IOError:
                 pass
+
+
+    def visitnode(self, *args, **kwargs):
+        pass
+
+    def visitnodeend(self, *args, **kwargs):
+        pass
+
+    def visitoperator(self, n, op):
+        if op != ";":
+            raise BashFeatureNotSupported(op)
+
+    def visitlist(self, n, parts):
+        pass
+
+    def visitpipe(self, *args, **kwargs):
+        raise BashFeatureNotSupported("pipes")
+
+    def visitpipeline(self, *args, **kwargs):
+        pass
+
+    def visitcompound(self, *args, **kwargs):
+        pass
+
+    def visitif(self, *args, **kwargs):
+        raise BashFeatureNotSupported("if")
+
+    def visitfor(self, *args, **kwargs):
+        raise BashFeatureNotSupported("for")
+
+    def visitwhile(self, *args, **kwargs):
+        raise BashFeatureNotSupported("while")
+
+    def visituntil(self, *args, **kwargs):
+        raise BashFeatureNotSupported("until")
+
+    def visitcommand(self, n, parts):
+        ret = self.onecmd(' '.join([part.word for part in parts]))
+        self.last_cmd_return = ret
+
+    def visitfunction(self, *args, **kwargs):
+        pass
+
+    def visitword(self, *args, **kwargs):
+        pass
+
+    def visitassignment(self, *args, **kwargs):
+        raise BashFeatureNotSupported("assignments")
+
+    def visitreservedword(self, *args, **kwargs):
+        pass
+
+    def visitparameter(self, *args, **kwargs):
+        pass
+
+    def visittilde(self, *args, **kwargs):
+        raise BashFeatureNotSupported("~")
+
+    def visitredirect(self, *args, **kwargs):
+        pass
+
+    def visitheredoc(self, *args, **kwargs):
+        pass
+
+    def visitprocesssubstitution(self, *args, **kwargs):
+        pass
+
+    def visitcommandsubstitution(self, *args, **kwargs):
+        pass
+
+    def visitcase(self, *args, **kwargs):
+        raise BashFeatureNotSupported("case")
+
+    def visitpattern(self, *args, **kwargs):
+        pass
+
+    def visitunimplemented(self, *args, **kwargs):
+        raise BashFeatureNotSupported("unimplemented")
+
 
     # We need to override this to fix readline
     def cmdloop(self, intro: str = None):  # pylint: disable=too-many-branches
@@ -171,10 +251,16 @@ class ClickCmd(Cmd):
                         click.echo('KeyboardInterrupt', file=self._stdout)
                         continue
                 try:
-                    line = self.precmd(line)
-                    stop = self.onecmd(line)
+                    cmds = self.precmd(line)
+                    for cmd in cmds:
+                        self.visit(cmd)
+                    stop = self.last_cmd_return
                     stop = self.postcmd(stop, line)
-                except CommandChainException:
+                except bash.errors.ParsingError as e:
+                    click.echo(f"Invalid syntax: {e}", file=self._stdout)
+                    self.cmdqueue.flush()
+                except ClickShellException as e:
+                    click.echo(f"Error: {e}", file=self._stdout)
                     self.cmdqueue.flush()
 
         finally:
@@ -186,21 +272,11 @@ class ClickCmd(Cmd):
                     readline.set_completer_delims(self.old_delims)
 
     def precmd(self, line: Union[str, Command]) -> str:
-        if isinstance(line, str):
-            if any([chain in line for chain in ["&&", "||"]]):
-                self.cmdqueue.parse_line(line=line)
-                line = self.cmdqueue.pop(0).text
-        if isinstance(line, Command):
-            # a non-zero return code followed by and AND-ed command
-            if self.ctx.return_code and line.cmd_type == Command.AND:  # noqa: return_code set in initial context
-                raise CommandChainException
-            # a zero return code followed by an OR-ed command
-            elif not self.ctx.return_code and line.cmd_type == Command.OR:  # noqa: return_code set in initial context
-                raise CommandChainException
-            else:
-                line = line.text
-
-        return line
+        if not line:
+            return []
+        parsed = bash.parse(line)
+        self.last_cmd_return = None
+        return parsed
 
     def get_prompt(self) -> Optional[str]:
         if callable(self.prompt):
